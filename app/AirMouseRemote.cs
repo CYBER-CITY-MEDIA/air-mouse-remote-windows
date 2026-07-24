@@ -7,19 +7,14 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-/// <summary>
-/// Air Mouse Remote — product shell for EASYTONE/G10-class remotes.
-/// MIC (HID 0xCF) -> set air mouse mic -> Win+H
-/// First-run wizard teaches setup + click vs Enter lock behavior.
-/// </summary>
+// MIC HID 0xCF -> Win+H. Always visible in TASKBAR + SYSTEM TRAY.
+
 public class AirMouseRemote : Form {
     const int WM_INPUT = 0x00FF;
     const int RID_INPUT = 0x10000003;
     const int RIDI_DEVICENAME = 0x20000007;
     const int RIM_TYPEHID = 2;
     const uint RIDEV_INPUTSINK = 0x00000100;
-    const string AppTitle = "Air Mouse Remote";
-    const string MutexName = "Global\\AirMouseRemote_SingleInstance";
 
     [StructLayout(LayoutKind.Sequential)]
     struct RAWINPUTDEVICE { public ushort usUsagePage; public ushort usUsage; public uint dwFlags; public IntPtr hwndTarget; }
@@ -39,196 +34,133 @@ public class AirMouseRemote : Form {
     [DllImport("kernel32.dll")]
     static extern bool Beep(int f, int d);
 
-    string dir, logPath, flagPath;
     NotifyIcon tray;
-    Label status;
-    TextBox guide;
+    Label lbl;
+    string dir, logPath;
     DateTime lastFire = DateTime.MinValue;
     bool micWasDown;
-    System.Windows.Forms.Timer heartbeat;
 
     public AirMouseRemote() {
-        dir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
+        dir = Path.GetDirectoryName(Application.ExecutablePath);
+        if (string.IsNullOrEmpty(dir))
+            dir = @"C:\Users\trent\Documents\AirMouse";
         logPath = Path.Combine(dir, "airmouse-remote.log");
-        flagPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AirMouseRemote", "setup-done.flag");
 
-        Text = AppTitle + " — MIC = Win+H";
-        Width = 640;
-        Height = 520;
+        // TASKBAR: always
+        Text = "Air Mouse Remote - MIC = Win+H (RUNNING)";
+        Name = "AirMouseRemoteMain";
+        Width = 520;
+        Height = 260;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
-        BackColor = Color.FromArgb(18, 20, 26);
-        ForeColor = Color.FromArgb(230, 235, 240);
-        Font = new Font("Segoe UI", 10f);
+        MinimizeBox = true;
+        ShowInTaskbar = true;          // FORCE taskbar button
+        ShowIcon = true;
+        TopMost = true;
+        Visible = true;
+        WindowState = FormWindowState.Normal;
+        BackColor = Color.FromArgb(0, 90, 45);
+        ForeColor = Color.White;
+        try { Icon = SystemIcons.Shield; } catch { }
 
-        status = new Label {
-            Left = 16, Top = 12, Width = 600, Height = 56,
-            Font = new Font("Segoe UI", 13f, FontStyle.Bold),
-            ForeColor = Color.LightGreen,
-            Text = "RUNNING — press MIC on the air mouse"
+        lbl = new Label {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14),
+            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Text =
+                "AIR MOUSE REMOTE IS ON\r\n\r\n" +
+                "Taskbar + tray icon should both show this app.\r\n\r\n" +
+                "1) Click a text box\r\n" +
+                "2) Press MIC on remote\r\n" +
+                "3) Win+H -> speak\r\n\r\n" +
+                "X minimizes (does not quit). Tray = Exit completely."
+        };
+        Controls.Add(lbl);
+
+        // SYSTEM TRAY: always
+        tray = new NotifyIcon();
+        try {
+            tray.Icon = SystemIcons.Shield;
+            tray.Text = "Air Mouse Remote ON - MIC = Win+H";
+            tray.Visible = true;
+            tray.BalloonTipTitle = "Air Mouse Remote";
+            tray.BalloonTipText = "Running - MIC = Win+H. Also on taskbar.";
+            tray.DoubleClick += (s, e) => ShowMain();
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Show window (taskbar)", null, (s, e) => ShowMain());
+            menu.Items.Add("Test Win+H", null, (s, e) => Fire("tray"));
+            menu.Items.Add("Exit completely", null, (s, e) => {
+                try { tray.Visible = false; tray.Dispose(); } catch { }
+                Application.Exit();
+            });
+            tray.ContextMenuStrip = menu;
+        } catch (Exception ex) {
+            Log("tray fail " + ex.Message);
+        }
+
+        Load += (s, e) => {
+            try {
+                // ensure visible on taskbar after handle created
+                ShowInTaskbar = true;
+                WindowState = FormWindowState.Normal;
+                Show();
+                Activate();
+                BringToFront();
+                RegisterRaw();
+                Log("STARTED taskbar+tray build");
+                try {
+                    tray.Visible = true;
+                    tray.ShowBalloonTip(4000, "Air Mouse Remote ON",
+                        "In taskbar AND tray. MIC = Win+H.", ToolTipIcon.Info);
+                } catch { }
+            } catch (Exception ex) {
+                Log("Load " + ex);
+            }
         };
 
-        guide = new TextBox {
-            Left = 16, Top = 72, Width = 600, Height = 340,
-            Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-            BackColor = Color.FromArgb(28, 32, 40), ForeColor = Color.WhiteSmoke,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font("Segoe UI", 9.5f),
-            Text = GuideText()
-        };
-
-        var btnTest = MkBtn("Test Win+H", 16, 430, 120);
-        var btnGuide = MkBtn("Show quick guide", 150, 430, 140);
-        var btnHide = MkBtn("Hide to tray", 304, 430, 120);
-        var btnStartup = MkBtn("Install startup", 438, 430, 130);
-        btnTest.Click += (s, e) => Fire("test");
-        btnGuide.Click += (s, e) => ShowWizard(false);
-        btnHide.Click += (s, e) => HideToTray();
-        btnStartup.Click += (s, e) => { InstallStartup(); MessageBox.Show(this, "Will start with Windows.", AppTitle); };
-
-        Controls.AddRange(new Control[] { status, guide, btnTest, btnGuide, btnHide, btnStartup });
-
-        tray = new NotifyIcon {
-            Icon = SystemIcons.Information,
-            Text = AppTitle + " (MIC = Win+H)",
-            Visible = true
-        };
-        tray.DoubleClick += (s, e) => { Show(); Activate(); };
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Show", null, (s, e) => { Show(); Activate(); });
-        menu.Items.Add("Quick guide", null, (s, e) => { Show(); ShowWizard(false); });
-        menu.Items.Add("Test Win+H", null, (s, e) => Fire("tray"));
-        menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
-        tray.ContextMenuStrip = menu;
-
-        Load += OnLoad;
+        // X = MINIMIZE to taskbar (still visible on taskbar), keep tray
         FormClosing += (s, e) => {
             if (e.CloseReason == CloseReason.UserClosing) {
                 e.Cancel = true;
-                HideToTray();
+                WindowState = FormWindowState.Minimized;
+                ShowInTaskbar = true; // stay on taskbar when minimized
+                Log("minimized (still running taskbar+tray)");
+                try {
+                    tray.ShowBalloonTip(2000, "Still running",
+                        "Minimized to taskbar. Tray icon also on. MIC still works.", ToolTipIcon.Info);
+                } catch { }
             }
         };
-    }
 
-    Button MkBtn(string t, int x, int y, int w) {
-        var b = new Button {
-            Text = t, Left = x, Top = y, Width = w, Height = 34,
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(50, 90, 160),
-            ForeColor = Color.White
-        };
-        b.FlatAppearance.BorderSize = 0;
-        return b;
-    }
-
-    static string GuideText() {
-        return
-            "SAME DEVICE AS AMAZON EASYTONE / G10 AIR MOUSE\r\n" +
-            "================================================\r\n\r\n" +
-            "WHAT THIS APP DOES\r\n" +
-            "  • Listens for the MIC button (special HID signal, not a normal key)\r\n" +
-            "  • Selects the air mouse microphone in Windows\r\n" +
-            "  • Presses Windows + H (built-in Voice Typing)\r\n" +
-            "  • Runs in the background (tray icon)\r\n\r\n" +
-            "HOW TO DICTATE\r\n" +
-            "  1. Click inside a text box (chat, email, Notepad…)\r\n" +
-            "  2. Press MIC on the remote (beep = software heard it)\r\n" +
-            "  3. Speak into the mic hole on the remote\r\n" +
-            "  4. Stop with MIC again or the Voice Typing UI\r\n\r\n" +
-            "CENTER BUTTON = CLICK vs ENTER  (very important)\r\n" +
-            "  • Air mouse UNLOCKED (cursor moves when you wave)\r\n" +
-            "      → center button = MOUSE CLICK\r\n" +
-            "  • Air mouse LOCKED (use the mouse on/off key; pointer stops flying)\r\n" +
-            "      → center button = ENTER\r\n" +
-            "  For dictation, lock the air mouse when you need Enter to send/confirm.\r\n\r\n" +
-            "WHY SOFTWARE IS REQUIRED\r\n" +
-            "  The listing is “Windows compatible” for mouse/keyboard. The MIC button\r\n" +
-            "  was designed for Android TV voice search. This app maps it to Win+H.\r\n";
-    }
-
-    void OnLoad(object s, EventArgs e) {
-        Register();
-        Log("STARTED");
-        heartbeat = new System.Windows.Forms.Timer { Interval = 5000 };
-        heartbeat.Tick += (a, b) => {
+        // heartbeat file so we know it's alive
+        var hb = new System.Windows.Forms.Timer { Interval = 3000 };
+        hb.Tick += (s, e) => {
             try {
-                string hb = Path.Combine(dir, "heartbeat.txt");
-                File.WriteAllText(hb, DateTime.Now.ToString("o"));
+                File.WriteAllText(Path.Combine(dir, "heartbeat.txt"), DateTime.Now.ToString("o"));
+                if (tray != null && !tray.Visible) tray.Visible = true;
             } catch { }
         };
-        heartbeat.Start();
+        hb.Start();
 
-        bool first = !File.Exists(flagPath);
-        if (first) {
-            InstallStartup();
-            ShowWizard(true);
-            try {
-                Directory.CreateDirectory(Path.GetDirectoryName(flagPath));
-                File.WriteAllText(flagPath, DateTime.Now.ToString("o"));
-            } catch { }
-        } else {
-            HideToTray();
-            try { tray.ShowBalloonTip(2500, AppTitle, "Running — press MIC for dictation", ToolTipIcon.Info); } catch { }
-        }
+        Application.ThreadException += (s, e) => Log("UI " + e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => Log("FATAL " + e.ExceptionObject);
     }
 
-    void ShowWizard(bool firstRun) {
+    void ShowMain() {
+        ShowInTaskbar = true;
         Show();
+        WindowState = FormWindowState.Normal;
         Activate();
-        string title = firstRun ? "Welcome — 60 second setup" : "Air mouse quick guide";
-        string msg =
-            "For the EASYTONE / G10 air mouse on Windows:\r\n\r\n" +
-            "1) Dongle plugged in\r\n" +
-            "2) This app running in the tray (auto-starts with Windows)\r\n" +
-            "3) Click a text box → press MIC → speak\r\n\r\n" +
-            "CENTER BUTTON:\r\n" +
-            "• Wave mode (unlocked) = CLICK\r\n" +
-            "• Locked air mouse = ENTER\r\n\r\n" +
-            "Lock the air mouse when you need Enter after dictating.";
-        MessageBox.Show(this, msg, title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        BringToFront();
     }
 
-    void HideToTray() {
-        Hide();
-        try { tray.ShowBalloonTip(1500, AppTitle, "Still running in tray", ToolTipIcon.Info); } catch { }
-    }
-
-    void InstallStartup() {
-        try {
-            string startup = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-            string lnk = Path.Combine(startup, "Air Mouse Remote.lnk");
-            string exe = Application.ExecutablePath;
-            // Use WScript via temp vbs to avoid COM issues
-            string vbs = Path.Combine(Path.GetTempPath(), "amr-startup.vbs");
-            File.WriteAllText(vbs,
-                "Set s=CreateObject(\"WScript.Shell\")\r\n" +
-                "Set sc=s.CreateShortcut(\"" + lnk.Replace("\\", "\\\\") + "\")\r\n" +
-                "sc.TargetPath=\"" + exe.Replace("\\", "\\\\") + "\"\r\n" +
-                "sc.WorkingDirectory=\"" + dir.Replace("\\", "\\\\") + "\"\r\n" +
-                "sc.Save\r\n");
-            // simpler: PowerShell
-            string ps = string.Format(
-                "$w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut('{0}'); $s.TargetPath='{1}'; $s.WorkingDirectory='{2}'; $s.Save()",
-                lnk.Replace("'", "''"), exe.Replace("'", "''"), dir.Replace("'", "''"));
-            Process.Start(new ProcessStartInfo {
-                FileName = "powershell.exe",
-                Arguments = "-NoProfile -Command " + ps,
-                CreateNoWindow = true,
-                UseShellExecute = false
-            });
-            Log("startup installed");
-        } catch (Exception ex) { Log("startup fail " + ex.Message); }
-    }
-
-    void Register() {
+    void RegisterRaw() {
         var devs = new RAWINPUTDEVICE[] {
             new RAWINPUTDEVICE { usUsagePage = 0x0C, usUsage = 0x01, dwFlags = RIDEV_INPUTSINK, hwndTarget = Handle },
             new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x06, dwFlags = RIDEV_INPUTSINK, hwndTarget = Handle },
             new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x02, dwFlags = RIDEV_INPUTSINK, hwndTarget = Handle },
-            new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x01, dwFlags = RIDEV_INPUTSINK, hwndTarget = Handle },
         };
         bool ok = RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
         Log(ok ? "RawInput OK" : "RawInput FAIL " + Marshal.GetLastWin32Error());
@@ -256,42 +188,41 @@ public class AirMouseRemote : Form {
     }
 
     void Fire(string reason) {
-        if ((DateTime.Now - lastFire).TotalMilliseconds < 800) return;
-        lastFire = DateTime.Now;
-        Log("FIRE " + reason);
-        try { Beep(1400, 50); Beep(1800, 50); } catch { }
-
         try {
-            string ps1 = Path.Combine(dir, "Set-BestMic.ps1");
-            if (File.Exists(ps1)) {
-                Process.Start(new ProcessStartInfo {
-                    FileName = "powershell.exe",
-                    Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + ps1 + "\"",
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                });
-            }
-        } catch (Exception ex) { Log("mic " + ex.Message); }
+            if ((DateTime.Now - lastFire).TotalMilliseconds < 700) return;
+            lastFire = DateTime.Now;
+            Log("FIRE " + reason);
+            try { Beep(1200, 50); Beep(1600, 50); } catch { }
 
-        ThreadPool.QueueUserWorkItem(_ => {
             try {
-                Thread.Sleep(250);
-                keybd_event(0x5B, 0, 0, UIntPtr.Zero);
-                keybd_event(0x48, 0, 0, UIntPtr.Zero);
-                keybd_event(0x48, 0, 2, UIntPtr.Zero);
-                keybd_event(0x5B, 0, 2, UIntPtr.Zero);
-                Log("sent Win+H");
-            } catch (Exception ex) { Log("winh " + ex.Message); }
-        });
+                string ps1 = Path.Combine(dir, "Set-BestMic.ps1");
+                if (File.Exists(ps1)) {
+                    Process.Start(new ProcessStartInfo {
+                        FileName = "powershell.exe",
+                        Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + ps1 + "\"",
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    });
+                }
+            } catch (Exception ex) { Log("mic " + ex.Message); }
 
-        try {
-            if (status.IsHandleCreated)
-                BeginInvoke(new Action(() => {
-                    status.Text = "MIC heard — Win+H sent — speak now";
-                    status.ForeColor = Color.Yellow;
-                }));
-        } catch { }
-        try { tray.ShowBalloonTip(1200, "Dictation", "Win+H — speak now", ToolTipIcon.Info); } catch { }
+            var t = new System.Windows.Forms.Timer { Interval = 200 };
+            t.Tick += (s, e) => {
+                try {
+                    t.Stop(); t.Dispose();
+                    keybd_event(0x5B, 0, 0, UIntPtr.Zero);
+                    keybd_event(0x48, 0, 0, UIntPtr.Zero);
+                    keybd_event(0x48, 0, 2, UIntPtr.Zero);
+                    keybd_event(0x5B, 0, 2, UIntPtr.Zero);
+                    Log("sent Win+H");
+                    lbl.Text = "SENT Win+H — SPEAK NOW\r\n\r\nApp still on taskbar + tray";
+                    try { tray.ShowBalloonTip(1500, "Win+H", "Speak now", ToolTipIcon.Info); } catch { }
+                } catch (Exception ex) { Log("winh " + ex.Message); }
+            };
+            t.Start();
+        } catch (Exception ex) {
+            Log("Fire ERR " + ex.Message);
+        }
     }
 
     static bool HasCf(byte[] data) {
@@ -330,7 +261,9 @@ public class AirMouseRemote : Form {
                     } finally { Marshal.FreeHGlobal(buf); }
                 }
             }
-        } catch (Exception ex) { Log("WndProc " + ex.Message); }
+        } catch (Exception ex) {
+            Log("WndProc " + ex.Message);
+        }
         base.WndProc(ref m);
     }
 
@@ -339,16 +272,26 @@ public class AirMouseRemote : Form {
         try {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
             bool created;
-            using (var mx = new Mutex(true, MutexName, out created)) {
+            using (var mx = new Mutex(true, "Local\\AirMouseRemote_TaskbarTray_v3", out created)) {
                 if (!created) {
-                    MessageBox.Show(AppTitle + " is already running (check the system tray).", AppTitle);
+                    // already running - don't silently vanish; ping log
+                    try {
+                        File.AppendAllText(
+                            Path.Combine(@"C:\Users\trent\Documents\AirMouse", "airmouse-remote.log"),
+                            DateTime.Now.ToString("HH:mm:ss") + " second instance exit (already running)\r\n");
+                    } catch { }
                     return;
                 }
                 Application.Run(new AirMouseRemote());
             }
         } catch (Exception ex) {
-            MessageBox.Show(ex.Message, AppTitle + " error");
+            try {
+                File.AppendAllText(@"C:\Users\trent\Documents\AirMouse\airmouse-remote.log", "MAIN FATAL " + ex + "\r\n");
+                MessageBox.Show("Failed to start:\r\n" + ex.Message, "Air Mouse Remote");
+            } catch { }
         }
     }
 }
