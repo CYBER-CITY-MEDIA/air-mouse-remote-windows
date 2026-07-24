@@ -1,0 +1,8 @@
+﻿# .gitignore
+*.log
+heartbeat.txt
+setup-done.flag
+bin/
+obj/
+.vs/
+*.user
